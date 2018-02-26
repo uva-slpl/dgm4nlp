@@ -718,7 +718,10 @@ def botev_sampled_softmax_layer(
         dim,
         labels,  # [B, N]
         inputs,  # [B, M, d]
-        is_training):
+        is_training,
+        kernel=None,
+        bias=None
+    ):
     """
     Creates a sampled softmax layer that can be used for marginalisation.
 
@@ -729,6 +732,8 @@ def botev_sampled_softmax_layer(
     :param inputs: forward activations [B, M, d]
         Here the sequence of activations do not need to have the same length as labels.
     :param is_training: in training we sample the support, in test/validation we use the entire support
+    :param kernel: weight matrix [nb_classes, dim]
+    :param bias: bias vector [nb_classes]
     :return:
         logits: [B, M, S]
         targets: [B, N]
@@ -740,15 +745,21 @@ def botev_sampled_softmax_layer(
 
     # Projection for classes
     # [V, d]
-    c_embeddings = tf.get_variable(
-        name='class_embedding',
-        initializer=tf.random_uniform_initializer(),
-        shape=[nb_classes, dim])
+    if kernel is None:
+        c_embeddings = tf.get_variable(
+            name='class_embedding',
+            initializer=tf.random_uniform_initializer(),
+            shape=[nb_classes, dim])
+    else:
+        c_embeddings = kernel
     # [V]
-    c_biases = tf.get_variable(
-        name='class_bias',
-        initializer=tf.random_uniform_initializer(),
-        shape=[nb_classes])
+    if bias is None:
+        c_biases = tf.get_variable(
+            name='class_bias',
+            initializer=tf.random_uniform_initializer(),
+            shape=[nb_classes])
+    else:
+        c_biases = bias
 
     def sampled_softmax():
         """
@@ -819,6 +830,9 @@ def botev_sampled_softmax_layer(
     return tf.cond(is_training, true_fn=sampled_softmax, false_fn=exact_softmax)
 
 
+import logging
+
+
 def np_get_support(
         nb_classes,
         nb_samples,
@@ -876,7 +890,12 @@ def botev_batch_sampled_softmax_layer(
         support,  # [S]
         importance,  # [S]
         inputs,  # [B, M, d]
-        is_training
+        is_training,
+        dropout=None,
+        kernel=None,
+        bias=None,
+        name='css',
+        reuse=None
 ):
     """
     Creates a sampled softmax layer that can be used for marginalisation.
@@ -888,22 +907,47 @@ def botev_batch_sampled_softmax_layer(
     :param importance: importance weights of classes in support [S]
     :param inputs: forward activations [B, M, d]
         Here the sequence of activations do not need to have the same length as labels.
+    :param is_training: rank-0 boolean tensor indicating whether this is training phase
+    :param dropout: drop out rate, a float or None
+    :param kernel: weight matrix [nb_classes, dim]
+    :param bias: bias vector [nb_classes]
+    :param name:
+    :param reuse:
     :return:
         logits: [B, M, S]
         targets: [B, N]
     """
 
-    # Projection for classes
-    # [V, d]
-    c_W = tf.get_variable(
-        name='class_embedding',
-        initializer=tf.random_uniform_initializer(),
-        shape=[nb_classes, dim])
-    # [V]
-    c_b = tf.get_variable(
-        name='class_bias',
-        initializer=tf.random_uniform_initializer(),
-        shape=[nb_classes])
+    if dropout:
+        name = '{}/ff_dropout'.format(name)
+
+    with tf.variable_scope(name, reuse=reuse):
+
+        # Projection for classes
+        # [V, d]
+        if kernel is None:
+            c_W = tf.get_variable(
+                name='kernel',
+                initializer=tf.random_uniform_initializer(),
+                shape=[nb_classes, dim])
+        else:
+            c_W = kernel
+
+        # [V]
+        if bias is None:
+            c_b = tf.get_variable(
+                name='bias',
+                initializer=tf.random_uniform_initializer(),
+                shape=[nb_classes])
+        else:
+            c_b = bias
+
+        if dropout:  # here we optionally drop some inputs
+            inputs = tf.layers.dropout(
+                inputs=inputs,
+                rate=dropout,
+                training=is_training
+            )
 
     def sampled_softmax():
         # Embed classes in support

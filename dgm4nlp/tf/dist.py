@@ -147,7 +147,7 @@ class Exponential(Distribution):
 
     def mean(self, params: list):
         rate = params[0]
-        return 1 / rate
+        return 1. / rate
 
     def random_standard(self, shape, dtype=tf.float32, seed=None, name=None):
         u = tf.random_uniform(shape, minval=0, maxval=1, dtype=dtype, seed=seed, name=name)

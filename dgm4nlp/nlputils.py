@@ -12,16 +12,18 @@ import numpy as np
 import itertools
 import os
 import tempfile
+from itertools import takewhile
 from collections import defaultdict
 from collections import Counter
 from dgm4nlp.recipes import smart_ropen
 
 
-def read_naacl_alignments(path):
+def read_naacl_alignments(path, reverse=False):
     """
     Read NAACL-formatted alignment files.
 
     :param path: path to file
+    :param reverse: reverse links (that is, if input is x-y, output becomes= y-x)
     :return: a list of pairs [sure set, possible set]
         each entry in the set maps an input position to an output position
         sentences start from 1 and a NULL token is indicated with position 0
@@ -37,6 +39,10 @@ def read_naacl_alignments(path):
             if len(fields) < 3:
                 raise ValueError('Missing required fields in line %d: %s' % (i, line.strip()))
             snt_id, x, y = int(fields[0]), int(fields[1]), int(fields[2])
+            if x == 0 or y == 0:  # we ignore NULL links
+                continue
+            if reverse:
+                x, y = y, x
             if len(fields) == 5:
                 sure = fields[3] == 'S'
                 prob = float(fields[4])
@@ -171,15 +177,25 @@ class Tokenizer:
 
     """
 
-    def __init__(self, nb_words=None, bos_str=None, eos_str=None, unk_str='-UNK-', pad_str='-PAD-', lowercase=False):
+    def __init__(self, nb_words=None, bos_str=None, eos_str=None, unk_str='-UNK-', pad_str='-PAD-', lowercase=False,
+                 mode='tokens', longest_token=None, noise_str='-RAND-'):
         """
 
-        :param nb_words: if not None, keeps only the most frequent tokens
+        :param nb_words: use None to keep the entire vocabulary of tokens,
+            use a positive integer (N) to keep only the N most frequent tokens
+            use a negative integer (-N) to keep only tokens that occurs more than N times
         :param bos_str: an optional BOS symbol
         :param eos_str: an optional EOS symbol
         :param unk_str: a string to map UNK tokens to
         :param pad_str: a string to visualise padding
+        :param lowercase: lowercase the input
+        :param mode: splitting sentences into 'tokens' or 'chars'
+        :param longest_token: tokens longer than this quantity will have characters removed at random positions
+            until they fit within the limit
+        :param noise_str: it marks tokens that have been shortened
         """
+        if mode not in ['tokens', 'chars']:
+            raise ValueError('I only accept two modes (tokens and chars) got %s' % mode)
         self._nb_words = nb_words
         self._counts = Counter()
         self._vocab = {pad_str: 0, unk_str: 1}
@@ -188,6 +204,12 @@ class Tokenizer:
         self._unk_str = unk_str
         self._bos_str = bos_str
         self._eos_str = eos_str
+        self._longest_token = longest_token
+        self._noise_str = noise_str
+        self._mode = mode
+        if self._mode == 'chars':
+            self._vocab[noise_str] = len(self._tokens)
+            self._tokens.append(noise_str)
         if bos_str is not None:
             self._vocab[bos_str] = len(self._tokens)
             self._tokens.append(bos_str)
@@ -199,13 +221,24 @@ class Tokenizer:
         normalise = lambda s: s.lower() if lowercase else s
 
         if self._bos_str and self._eos_str:
-            self._tokenize = lambda s: [self._bos_str] + normalise(s).split() + [self._eos_str]
+            self._tokenize_line = lambda s: [self._bos_str] + normalise(s).split() + [self._eos_str]
         elif self._bos_str:
-            self._tokenize = lambda s: [self._bos_str] + normalise(s).split()
+            self._tokenize_line = lambda s: [self._bos_str] + normalise(s).split()
         elif self._eos_str:
-            self._tokenize = lambda s: normalise(s).split() + [self._eos_str]
+            self._tokenize_line = lambda s: normalise(s).split() + [self._eos_str]
         else:
-            self._tokenize = lambda s: normalise(s).split()
+            self._tokenize_line = lambda s: normalise(s).split()
+
+        self._normalise = normalise
+
+    def char_level(self):
+        return self._mode == 'chars'
+
+    def unk_id(self):
+        return self._vocab[self._unk_str]
+
+    def pad_id(self):
+        return self._vocab[self._pad_str]
 
     def fit_one(self, input_stream):
         """
@@ -222,13 +255,22 @@ class Tokenizer:
 
         :param input_streams: a collection of input streams (e.g. list of file handlers)
         """
-        for stream in input_streams:
-            for line in stream:
-                self._counts.update(line.split())
+        if self._mode == 'tokens':
+            split_fn = lambda line: line.split()
+        else:  # chars
+            split_fn = lambda line: line.strip()
 
-        for token, count in self._counts.most_common(self._nb_words):
-            self._vocab[token] = len(self._tokens)
-            self._tokens.append(token)
+        for stream in input_streams:
+            self._counts.update(itertools.chain(*(split_fn(line) for line in stream)))
+
+        if self._nb_words is None or self._nb_words > 0:
+            for token, count in self._counts.most_common(self._nb_words):
+                self._vocab[token] = len(self._tokens)
+                self._tokens.append(token)
+        else:
+            for token, count in takewhile(lambda pair: pair[1] > -self._nb_words, self._counts.most_common()):
+                self._vocab[token] = len(self._tokens)
+                self._tokens.append(token)
 
     def vocab_size(self):
         return len(self._tokens)
@@ -238,13 +280,57 @@ class Tokenizer:
 
     def to_sequences(self, input_stream, dtype='int64'):
         unk_id = self._vocab[self._unk_str]
-        return [np.array([self._vocab.get(word, unk_id) for word in self._tokenize(line)], dtype=dtype)
-                         for line in input_stream]
+        if self._mode == 'tokens':
+            return [np.array([self._vocab.get(word, unk_id) for word in self._tokenize_line(line)], dtype=dtype) for line in input_stream]
+        else:  # chars
+            return [self._sequence2chars(line, dtype=dtype) for line in input_stream]
+
+    def _sequence2chars(self, snt, dtype='int64'):
+        max_len = self._longest_token
+        noise_id = self._vocab.get(self._noise_str)
+        unk_id = self._vocab.get(self._unk_str)
+        tokens = self._normalise(snt).split()
+        length = np.array([len(tok) for tok in tokens], dtype='int32')
+        longest = np.max(length)
+        n_tokens = len(tokens)
+        lshift = 1 if self._bos_str else 0
+        rshift = 1 if self._eos_str else 0
+
+        matrix = np.zeros(
+            [n_tokens + lshift + rshift, longest + 2 if not max_len else np.minimum(longest, max_len) + 2],
+            dtype=dtype)  # +2 to account for noise tokens
+
+        if lshift:
+            matrix[0, 0] = self._vocab.get(self._bos_str)
+        if rshift:
+            matrix[-1, 0] = self._vocab.get(self._eos_str)
+
+        if not max_len or longest <= max_len:
+            for i, token in enumerate(tokens):
+                n = length[i]
+                matrix[i + lshift, :n] = [self._vocab.get(c, unk_id) for c in token]
+        else:
+            for i, token in enumerate(tokens):
+                in_n = length[i]
+                kept = token if in_n <= max_len else [token[j] for j in np.sort(np.random.choice(in_n, size=max_len, replace=False))]
+                out_n = len(kept)
+                if in_n == out_n:
+                    matrix[i + lshift, :out_n] = [self._vocab.get(c, unk_id) for c in kept]
+                else:
+                    matrix[i + lshift, 0] = noise_id
+                    matrix[i + lshift, 1:out_n + 1] = [self._vocab.get(c, unk_id) for c in kept]
+                    matrix[i + lshift, out_n + 1] = noise_id
+
+        return matrix
 
     def to_sequences_iterator(self, input_stream, dtype='int64'):
         unk_id = self._vocab[self._unk_str]
-        for line in input_stream:
-            yield np.array([self._vocab.get(word, unk_id) for word in self._tokenize(line)], dtype=dtype)
+        if self._mode == 'tokens':
+            for line in input_stream:
+                yield np.array([self._vocab.get(word, unk_id) for word in self._tokenize_line(line)], dtype=dtype)
+        else:  # chars
+            for line in input_stream:
+                yield self._sequence2chars(line, dtype=dtype)  # np.array([np.array([self._vocab.get(c, unk_id) for c in token], dtype=dtype) for token in self._tokenize(line)], dtype=dtype)
 
     def write_as_text(self, matrix, output_stream, skip_pad=True):
         """
@@ -254,13 +340,21 @@ class Tokenizer:
         :param output_stream: where to write text sequences to
         :param skip_pad: whether or not pads should be ignored (defaults to True)
         """
-        if skip_pad:
-            for seq in matrix:
-                print(' '.join(self._tokens[tid] for tid in itertools.takewhile(lambda x: x != 0, seq)),
-                      file=output_stream)
-        else:
-            for seq in matrix:
-                print(' '.join(self._tokens[tid] for tid in seq), file=output_stream)
+        if self._mode == 'tokens':
+            if skip_pad:
+                for seq in matrix:
+                    print(' '.join(self._tokens[tid] for tid in itertools.takewhile(lambda x: x != 0, seq)),
+                          file=output_stream)
+            else:
+                for seq in matrix:
+                    print(' '.join(self._tokens[tid] for tid in seq), file=output_stream)
+        else:  # chars
+            if skip_pad:
+                for seq in matrix:
+                    print(' '.join(''.join(self._tokens[tid] for tid in itertools.takewhile(lambda x: x != 0, tok)) for tok in seq), file=output_stream)
+            else:
+                for seq in matrix:
+                    print(' '.join(' '.join(self._tokens[tid] for tid in tok) for tok in seq), file=output_stream)
 
 
 def bound_length(input_paths, tokenizers, shortest, longest):
@@ -422,7 +516,7 @@ class Text:
                                              selection, nb_tokens, dtype=batch_dtype)
         # total number of tokens
         self._nb_tokens = nb_tokens
-        assert nb_tokens == self._sample_length.sum(), 'Something went wrong: input nb_tokens != memmaped nb_tokens'
+        assert nb_tokens == self._sample_length.sum(), 'Something went wrong: input nb_tokens %d != memmaped nb_tokens %d' % (nb_tokens, self._sample_length.sum())
         self._nb_samples = len(self._sample_length)
         # longest sequence in corpus (possibly not trimmed)
         self._longest = longest if not trim else self._sample_length.max()
@@ -781,3 +875,14 @@ def test_bitext(input_path1, input_path2, output_path1, output_path2):
                 tk1.write_as_text(b1, fo1)
                 tk2.write_as_text(b2, fo2)
     return bitext
+
+
+def test_char_tokenizer(input_path, output_path, longest_token=None):
+    tokenizer = Tokenizer(
+        nb_words=None, bos_str='-NULL-', eos_str=None, mode='chars', longest_token=longest_token,
+    )
+    tokenizer.fit_one(smart_ropen(input_path))
+    seqs = tokenizer.to_sequences(smart_ropen(input_path), dtype='int32')
+    with open(output_path, 'w') as fo:
+        tokenizer.write_as_text(seqs, output_stream=fo)
+    return tokenizer

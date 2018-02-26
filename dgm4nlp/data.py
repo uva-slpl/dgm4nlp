@@ -28,3 +28,7 @@ def create_synthetic_data(path, nb_samples=10000, vocab_size=10, length_range=[2
     with open(path, 'w') as fo:
         for row, length in zip(data, lengths):
             print(' '.join(str(x) for x in row[:length]), file=fo)
+
+
+
+

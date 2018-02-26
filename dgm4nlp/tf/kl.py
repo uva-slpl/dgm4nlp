@@ -36,3 +36,16 @@ def kl_diagonal_gaussians(mean1, log_var1, mean2, log_var2):
     var1 = tf.exp(log_var1)
     var2 = tf.exp(log_var2)
     return 0.5 * tf.reduce_sum(log_var2 - log_var1 + (var1 + tf.square(mean1 - mean2)) / var2 - 1, axis=-1)
+
+
+def kl_gaussian(params_i, params_j, diagonal=True):
+    if diagonal:
+        location_i, scale_i = params_i  # [mean, std]
+        location_j, scale_j = params_j  # [mean, std]
+        var_i = scale_i ** 2
+        var_j = scale_j ** 2
+        term1 = 1 / (2 * var_j) * ((location_i - location_j) ** 2 + var_i - var_j)
+        term2 = tf.log(scale_j) - tf.log(scale_i)
+        return term1 + term2
+    else:
+        raise NotImplementedError('KL for full covariances is not yet implemented')
